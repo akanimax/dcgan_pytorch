@@ -1,2 +1,6 @@
 # ignore the full version of the celeba dataset
 celeba
+
+# ignore the cifar-10 datasets
+cifar-10_with_labels
+cifar-10

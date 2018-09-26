@@ -2,9 +2,10 @@
 
 import torch as th
 import argparse
+import numpy as np
 
 from torch.backends import cudnn
-from attn_gan_pytorch.Losses import GANLoss
+from torchvision.datasets import CIFAR10
 
 # define the device for the training script
 device = th.device("cuda" if th.cuda.is_available() else "cpu")
@@ -20,11 +21,11 @@ def parse_arguments():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--generator_config", action="store", type=str,
-                        default="configs/dcgan/gen.conf",
+                        default="configs/dcgan-cifar-10-conditional/gen.conf",
                         help="default configuration for generator network")
 
     parser.add_argument("--discriminator_config", action="store", type=str,
-                        default="configs/dcgan/dis.conf",
+                        default="configs/dcgan-cifar-10-conditional/dis.conf",
                         help="default configuration for discriminator network")
 
     parser.add_argument("--generator_file", action="store", type=str,
@@ -36,20 +37,21 @@ def parse_arguments():
                         help="pretrained_weights file for discriminator")
 
     parser.add_argument("--images_dir", action="store", type=str,
-                        default="data/celeba",
+                        default="data/cifar-10_with_labels",
                         help="path for the images directory")
 
     parser.add_argument("--sample_dir", action="store", type=str,
-                        default="samples/dcgan",
+                        default="samples/dcgan-cifar-10-conditional",
                         help="path for the generated samples directory")
 
     parser.add_argument("--model_dir", action="store", type=str,
-                        default="models/dcgan",
+                        default="models/dcgan-cifar-10-conditional",
                         help="path for saved models directory")
 
     parser.add_argument("--loss_function", action="store", type=str,
                         default="standard-gan",
-                        help="loss function to be used: 'hinge', 'relativistic-hinge'")
+                        help="loss function to be used: 'hinge', " +
+                             "'relativistic-hinge', 'standard-gan'")
 
     parser.add_argument("--latent_size", action="store", type=int,
                         default=128,
@@ -96,32 +98,55 @@ def parse_arguments():
     return args
 
 
-# define the StandardGAN loss function
-class StandardGAN(GANLoss):
+# create the one-hot encoded cifar-10 dataset
+class OneHotCIFAR10(CIFAR10):
+    """
+    extends the CIFAR10 and one-hot encodes the labels
+    """
 
-    def __init__(self, dev, dis):
-        from torch.nn import BCELoss
+    @staticmethod
+    def one_hot_embedding(labels, num_classes):
+        """
+        Embedding labels to one-hot form
+        :param labels: (LongTensor) class labels, sized [N,]
+        :param num_classes: (int) number of classes
+        :return:(tensor) encoded labels, sized [N, #classes]
+        """
+        y = th.eye(num_classes)
+        return y[labels]
 
-        super().__init__(dev, dis)
+    def __getitem__(self, index):
+        """
+        one-hot encodes the labels before outputting
+        :param index: integer index
+        :return: images, labels: tensor[B x 3 x 32 x 32], tensor[B x 10]
+        """
+        images, labels = super().__getitem__(index)
+        labels = self.one_hot_embedding(labels, 10)
 
-        # define the criterion object
-        self.criterion = BCELoss()
-
-    def dis_loss(self, real_samps, fake_samps):
-        # calculate the real loss:
-        real_loss = self.criterion(th.squeeze(self.dis(real_samps)),
-                                   th.ones(real_samps.shape[0]).to(self.device))
-        # calculate the fake loss:
-        fake_loss = self.criterion(th.squeeze(self.dis(fake_samps)),
-                                   th.zeros(fake_samps.shape[0]).to(self.device))
-
-        # return final loss as average of the two:
-        return (real_loss + fake_loss) / 2
+        return images, labels
 
 
-    def gen_loss(self, _, fake_samps):
-        return self.criterion(th.squeeze(self.dis(fake_samps)),
-                              th.ones(fake_samps.shape[0]).to(self.device))
+def randomizer(correct_labels):
+    """
+    randomly change the correct_labels for mismatch
+    :param correct_labels: input correct labels
+    :return: mismatched labels
+    """
+    int_labels = th.argmax(correct_labels, dim=-1)
+    ranges = [list(range(correct_labels.shape[-1]))
+              for _ in range(correct_labels.shape[0])]
+    for i in range(len(int_labels)):
+        ranges[i].remove(int_labels[i])
+
+    mismatched_int_labels = list(map(lambda x: np.random.choice(x), ranges))
+    mismatched_labels = OneHotCIFAR10.one_hot_embedding(
+        th.LongTensor(mismatched_int_labels),
+        correct_labels.shape[-1]
+    ).to(device)
+
+    # return the so calculated mismatched labels:
+    return mismatched_labels
 
 
 def main(args):
@@ -132,20 +157,20 @@ def main(args):
     """
     from attn_gan_pytorch.Utils import get_layer
     from attn_gan_pytorch.ConfigManagement import get_config
-    from attn_gan_pytorch.Networks import Generator, Discriminator, GAN
-    from data_processing.DataLoader import FlatDirectoryImageDataset, \
-        get_transform, get_data_loader
+    from attn_gan_pytorch.Networks import ConditionalGenerator, \
+        ConditionalDiscriminator, ConditionalGAN
+    from data_processing.DataLoader import get_transform, get_data_loader
     from attn_gan_pytorch.Losses import HingeGAN, RelativisticAverageHingeGAN
+    from attn_gan_pytorch.Losses import StandardGAN
 
     # create a data source:
-    celeba_dataset = FlatDirectoryImageDataset(args.images_dir,
-                                               transform=get_transform((64, 64)))
-    data = get_data_loader(celeba_dataset, args.batch_size, args.num_workers)
+    cifar_10_dataset = OneHotCIFAR10(args.images_dir, transform=get_transform((32, 32)))
+    data = get_data_loader(cifar_10_dataset, args.batch_size, args.num_workers)
 
     # create generator object:
     gen_conf = get_config(args.generator_config)
     gen_conf = list(map(get_layer, gen_conf.architecture))
-    generator = Generator(gen_conf, args.latent_size)
+    generator = ConditionalGenerator(gen_conf, args.latent_size)
 
     if args.generator_file is not None:
         # load the weights into generator
@@ -157,7 +182,7 @@ def main(args):
     # create discriminator object:
     dis_conf = get_config(args.discriminator_config)
     dis_conf = list(map(get_layer, dis_conf.architecture))
-    discriminator = Discriminator(dis_conf)
+    discriminator = ConditionalDiscriminator(dis_conf[:-1], dis_conf[-1])
 
     if args.discriminator_file is not None:
         # load the weights into discriminator
@@ -167,7 +192,7 @@ def main(args):
     print(discriminator)
 
     # create a gan from these
-    dcgan = GAN(generator, discriminator, device=device)
+    conditional_dcgan = ConditionalGAN(generator, discriminator, device=device)
 
     # create optimizer for generator:
     gen_optim = th.optim.Adam(filter(lambda p: p.requires_grad, generator.parameters()),
@@ -188,7 +213,7 @@ def main(args):
         raise Exception("Unknown loss function requested")
 
     # train the GAN
-    dcgan.train(
+    conditional_dcgan.train(
         data,
         gen_optim,
         dis_optim,
@@ -198,6 +223,8 @@ def main(args):
         data_percentage=args.data_percentage,
         feedback_factor=args.feedback_factor,
         num_samples=64,
+        matching_aware=True,
+        mismatcher=randomizer,
         sample_dir=args.sample_dir,
         save_dir=args.model_dir,
         log_dir=args.model_dir,
