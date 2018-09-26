@@ -1,4 +1,4 @@
-""" script for training a Self Attention GAN on celeba images """
+""" script for training a DCGAN on for given dataset """
 
 import torch as th
 import argparse
